@@ -14,11 +14,13 @@ Below are some of the best practices we like to use when creating and executing 
 ### Defining a worker
 
 Sidekiq worker classes require two components:
+
 1. It **must** `include Sidekiq::Worker`
 2. It **must** have a public `perform` method
 3. It may have other options defined with `sidekiq_options`
 
 A basic worker that will enqueue and execute jobs in our default queue looks like:
+
 ```rb
 # app/workers/my_worker.rb
 class MyWorker
@@ -34,19 +36,21 @@ end
 ### Running a worker
 
 There are a few different ways to execute workers:
+
 1. `MyWorker.perform_async`
-  This will enqueue a job for this worker which will be executed as soon as possible. The amount of time it takes for the job to execute will depend on the number of jobs ahead of it in the queue and how quickly those jobs can be processed.
+   This will enqueue a job for this worker which will be executed as soon as possible. The amount of time it takes for the job to execute will depend on the number of jobs ahead of it in the queue and how quickly those jobs can be processed.
 
 2. `MyWorker.perform_in`
-  This will schedule a job to be enqueued in some number of seconds that you can define.
+   This will schedule a job to be enqueued in some number of seconds that you can define.
 
 3. `MyWorker.perform_at`
-  This will schedule a job to be enqueued at a specific time that you define.
-  
+   This will schedule a job to be enqueued at a specific time that you define.
+
 4. `MyWorker.new.perform`
-  This will execute the worker _synchronously_. This is generally not how you will want to execute the worker in production but is useful for executing your worker in unit tests.
+   This will execute the worker _synchronously_. This is generally not how you will want to execute the worker in production but is useful for executing your worker in unit tests.
 
 Any parameters passed to `perform_*` will be passed into the `perform` instance method.
+
 ```rb
 class MyWorker
   def perform(name, city)
@@ -66,6 +70,7 @@ MyWorker.new.perform('Prince Derek Grunkwitz', 'Dreamland')
 ### Naming Convention
 
 There are a few naming and organization conventions we like to use to help us easily locate workers and understand their function:
+
 1. All worker classes are defined in the 'app/workers/' directory. This directory can also have subdirectories to namespace workers.
 2. All worker classes end in 'Worker'
 3. Worker class names should describe the action they perform. For example: 'UpdateFooWorker'
@@ -78,9 +83,10 @@ We use this feature whenever we need a job to execute at a regulary set interval
 
 ### Enqueue-then-Process Pattern
 
-Often, we want to perform the same operation on a large number of records. This is particularly true for periodic batch jobs. For these jobs, we want to ensure
-1. each job executes quickly (see **Time Limit** below)
-1. a problem processing one record doesn't cause us to fail to process other records (see **Atomicity & Fragility** below)
+Often, we want to perform the same operation on a large number of records. This is particularly true for periodic batch jobs. For these jobs, we want to ensure:
+
+1. Each job executes quickly (see **Time Limit** below)
+2. A problem processing one record doesn't cause us to fail to process other records (see **Atomicity & Fragility** below)
 
 We use the **enqueue-then-process** pattern to achieve this. If the job is called with no parameters, it is in **enqueue** mode. If it is called with parameters (often IDs), it is in **process** mode.
 
@@ -92,12 +98,13 @@ class OrderConfirmationWorker
   def process(order_id = nil)
     order_id.nil? ? enqueue_jobs : process_order(order_id)
   end
-  
+
   private
 
   def enqueue_jobs
-    Order.where({ status: Order::CONFIRMED, notified_at: nil }).find_in_batches do |batch|
-      batch.ids.each { |id| self.class.perform_async(id) }
+    order_ids = Order.where({ status: Order::CONFIRMED, notified_at: nil }).pluck(:id)
+    order_ids.each do |id|
+      self.class.perform_async(id)
     end
   end
 
@@ -105,6 +112,25 @@ class OrderConfirmationWorker
     o = Order.find(order_id)
     MyEmailService.deliver!(:order_confirmation, o)
     o.update!({ notified_at: Time.now })
+  end
+end
+```
+
+This pattern is also a great opportunity for us to use [Bulk Queueing](https://github.com/mperham/sidekiq/wiki/Bulk-Queueing).
+By bulk queueing our jobs we can dramatically reduce the number of requests we need to make to Redis to enqueue jobs. This can have a significant impact on execution time when enqueueing hundreds or thousands of jobs.
+
+Here's what the `#enqueue_jobs` method from above would look like if we used bulk queueing:
+
+```rb
+def enqueue_jobs
+  order_ids = Order.where({ status: Order::CONFIRMED, notified_at: nil }).pluck(:id)
+
+  # Limiting bulk queueing to 1000 jobs at a time
+  order_ids.each_slice(1000) do |ids|
+    Sidekiq::Client.push_bulk(
+      'class' => self.class,
+      'args' => ids.map { |id| [id] },
+    )
   end
 end
 ```
@@ -122,6 +148,7 @@ Make sure it is _idempotent_ — that is, it produces the same result if it
 is run once or ten times.
 
 This is idempotent:
+
 ```rb
 class UpdateFooWorker
   def perform(id, new_params)
@@ -133,6 +160,7 @@ UpdateFooWorker.perform_async my_foo.id, { count: my_foo.count + 1 }
 ```
 
 This is not:
+
 ```rb
 class UpdateFooWorker
   def perform(id)
@@ -159,6 +187,7 @@ end
 We often use jobs to communicate with multiple systems. For example, the `OrderConfirmationWorker` might notify the Email service to send an email and then record the fact that the notification was sent locally.
 
 One way to write this would be
+
 ```rb
 def process(order_id)
   o = Order.find(order_id)
@@ -170,6 +199,7 @@ end
 It's more likely that `MyEmailService.deliver!` will fail than `o.update!` will, so this implementation creates the risk that we will mark the order as notified, but not actually send the notification.
 
 You can change it to
+
 ```rb
 def process(order_id)
   o = Order.find(order_id)
@@ -181,6 +211,7 @@ end
 Now the less reliable `MyEmailService.deliver!` is guaranteed to have happened by the time we run `o.update!`. Of course, "more reliable" doesn't mean "perfectly reliable," so now there's a risk that we send the notification but fail to mark the order has having been notified. If we re-run the job, the customer may get the same order confirmation email twice.
 
 Another alternative would be
+
 ```rb
 def process(order_id, activity = nil)
   return self.send(:"process_#{activity}", Order.find(order_id)) if activity.present?
@@ -219,7 +250,7 @@ class OrderConfirmationWorker
     self.class.perform_async order, :notify
     self.class.perform_async order, :mark_notified
   end
-  
+
   private
 
   def enqueue_jobs
